@@ -1,0 +1,80 @@
+# 思考链服务配置
+thinking_services:
+  - id: 1                      # 建议按照顺序指定 ID，以便日后扩展或记录（ID 本身不会参与逻辑计算）
+    name: "modelscope-deepseek-thinking"  # 随便取一个名字
+    mode: "standard"           # 模式，可设置为 "standard" 或 "full"。标准模式：只使用 reasoning_content 字段；完全模式：使用 reasoning_content + content 字段（完全模式不支持显示思考链）。
+    model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"  # 模型配置，可使用蒸馏模型，具体模型名称请咨询服务商
+    base_url: "https://api-inference.modelscope.cn"
+    api_path: "/v1/chat/completions"  # 与 base_url 拼接，遵循 OpenAI 标准
+    api_key: "sk-xxxxxxxxxxxxxxxx"
+    timeout: 600               # 请求超时时间，单位：秒
+    weight: 100                # 加权随机的比例权重，数值越高，被选中的概率越大
+    proxy: ""                  # 可选代理设置，留空则不使用代理（支持 HTTP/SOCKS5）
+    reasoning_effort: "high"   # 推理令牌数量，选项："low"、"medium"、"high"，可留空
+    reasoning_format: "parsed" # 推理过程格式，选项："parsed"、"raw"、"hidden"，可留空
+    temperature: 0.8           # 温度参数（覆盖默认值 0.7），可选
+    force_stop_deep_thinking: false  # 是否在标准模式下遇到不含有效 reasoning_content 时强制停止思考链
+
+  - id: 2
+    name: "tencent-deepseek-thinking"
+    mode: "full"              # 完全模式：收集 reasoning_content 与 content 全部内容，且不显示思考链
+    model: "deepseek-r1"       # 模型配置
+    base_url: "https://api.lkeap.cloud.tencent.com"
+    api_path: "/v1/chat/completions"
+    api_key: "sk-xxxxxxxxxxxxxxxx"
+    timeout: 600
+    weight: 50
+    proxy: "http://127.0.0.1:7890"  # HTTP代理示例
+    reasoning_effort: "medium"
+    force_stop_deep_thinking: true
+
+# API通道配置
+channels:
+  "1":                      # 建议按照顺序指定 ID
+    name: "modelscope-channel"
+    base_url: "https://api-inference.modelscope.cn"
+    api_path: "/v1/chat/completions"
+    timeout: 600
+    proxy: ""              # 不使用代理
+  
+  "2":
+    name: "openai-channel"
+    base_url: "https://api.openai.com"
+    api_path: "/v1/chat/completions"
+    timeout: 600
+    proxy: "socks5://127.0.0.1:7890"  # SOCKS5代理示例
+
+# 全局配置
+global:
+  log:
+    level: "info"          # 日志级别：可选 debug, info, warn, error
+    format: "json"         # 日志格式：可选 text, json
+    output: "file"         # 日志输出：可选 console, file
+    file_path: "./logs/deepai.log"
+    debug:
+      enabled: true       # 是否启用调试日志
+      print_request: true # 打印请求内容
+      print_response: true # 打印响应内容
+      max_content_length: 1000  # 内容打印最大长度，避免日志过大
+
+  server:
+    port: 8888
+    host: "0.0.0.0"
+    read_timeout: 600
+    write_timeout: 600
+    idle_timeout: 600
+
+  # 安全配置
+  security:
+    max_request_size: 10485760     # 最大请求体大小 (10MB)
+    request_timeout: 300           # 请求超时时间(秒)
+    enable_auth: false             # 是否启用API密钥认证
+    trusted_api_keys:              # 受信任的API密钥列表(启用认证时使用)
+      - "sk-trusted-key-1"
+      - "sk-trusted-key-2"
+    rate_limit:
+      requests_per_minute: 60      # 每分钟请求数限制
+      burst_size: 10              # 突发请求数
+    allowed_proxy_hosts:           # 允许的代理主机白名单
+      - "proxy.example.com"
+      - "127.0.0.1"

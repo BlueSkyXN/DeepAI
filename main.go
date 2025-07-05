@@ -101,6 +101,7 @@ type GlobalConfig struct {
 	Proxy       ProxyConfig    `mapstructure:"proxy"`
 	ConfigPaths []string       `mapstructure:"config_paths"`
 	Thinking    ThinkingConfig `mapstructure:"thinking"`
+	Security    SecurityConfig `mapstructure:"security"`
 }
 
 type ServerConfig struct {
@@ -233,8 +234,9 @@ func logAPIKey(key string) string {
 // ---------------------- Server 结构 ----------------------
 
 type Server struct {
-	config *Config
-	srv    *http.Server
+	config      *Config
+	srv         *http.Server
+	rateLimiter *SimpleRateLimiter
 }
 
 var (
@@ -243,8 +245,15 @@ var (
 )
 
 func NewServer(config *Config) *Server {
+	// 初始化速率限制器，默认值
+	requestsPerMinute := 60
+	if config.Global.Security.RateLimit.RequestsPerMinute > 0 {
+		requestsPerMinute = config.Global.Security.RateLimit.RequestsPerMinute
+	}
+	
 	return &Server{
-		config: config,
+		config:      config,
+		rateLimiter: NewSimpleRateLimiter(requestsPerMinute),
 	}
 }
 
@@ -278,9 +287,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
 	logger := NewRequestLogger(s.config)
 
+	// 速率限制检查
+	clientIP := getClientIP(r)
+	if !s.rateLimiter.Allow(clientIP) {
+		logger.Log("Rate limit exceeded for IP: %s", clientIP)
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	fullAPIKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	apiKey := extractRealAPIKey(fullAPIKey)
 	channelID := extractChannelID(fullAPIKey)
+
+	// API密钥验证
+	if s.config.Global.Security.EnableAuth {
+		if !validateAPIKey(apiKey, s.config.Global.Security.TrustedAPIKeys) {
+			logger.Log("Unauthorized API key access from IP: %s", clientIP)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 
 	logger.Log("Received request for %s with API Key: %s", r.URL.Path, logAPIKey(fullAPIKey))
 	logger.Log("Extracted channel ID: %s", channelID)
@@ -307,6 +333,13 @@ func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 请求大小限制
+	maxSize := int64(10 * 1024 * 1024) // 默认10MB
+	if s.config.Global.Security.MaxRequestSize > 0 {
+		maxSize = s.config.Global.Security.MaxRequestSize
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSize)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		logger.Log("Error reading request body: %v", err)
@@ -322,9 +355,18 @@ func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
 
 	var req ChatCompletionRequest
 	if err := json.NewDecoder(bytes.NewBuffer(body)).Decode(&req); err != nil {
+		logger.Log("Invalid JSON in request: %v", err)
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+	
+	// 输入验证
+	if err := validateChatCompletionRequest(&req); err != nil {
+		logger.Log("Request validation failed: %v", err)
+		http.Error(w, "Invalid request parameters", http.StatusBadRequest)
+		return
+	}
+	
 	req.APIKey = apiKey
 
 	thinkingService := s.getWeightedRandomThinkingService()
@@ -333,7 +375,7 @@ func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		handler, err := NewStreamHandler(w, thinkingService, targetChannel, s.config)
 		if err != nil {
-			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			sendSecureErrorResponse(w, "Streaming not supported", err, logger)
 			return
 		}
 		if err := handler.HandleRequest(r.Context(), &req); err != nil {
@@ -343,7 +385,7 @@ func (s *Server) handleOpenAIRequests(w http.ResponseWriter, r *http.Request) {
 		thinkingResp, err := s.processThinkingContent(r.Context(), &req, thinkingService)
 		if err != nil {
 			logger.Log("Error processing thinking content: %v", err)
-			http.Error(w, "Thinking service error: "+err.Error(), http.StatusInternalServerError)
+			sendSecureErrorResponse(w, "Service temporarily unavailable", err, logger)
 			return
 		}
 		enhancedReq := s.prepareEnhancedRequest(&req, thinkingResp, thinkingService)
@@ -514,19 +556,19 @@ func (s *Server) forwardRequest(w http.ResponseWriter, ctx context.Context, req 
 	}
 	jsonData, err := json.Marshal(req)
 	if err != nil {
-		http.Error(w, "Failed to marshal request", http.StatusInternalServerError)
+		sendSecureErrorResponse(w, "Request processing failed", err, logger)
 		return
 	}
 
 	client, err := createHTTPClient(channel.Proxy, time.Duration(channel.Timeout)*time.Second)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create HTTP client: %v", err), http.StatusInternalServerError)
+		sendSecureErrorResponse(w, "Service configuration error", err, logger)
 		return
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, channel.GetFullURL(), bytes.NewBuffer(jsonData))
 	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		sendSecureErrorResponse(w, "Request creation failed", err, logger)
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -534,21 +576,22 @@ func (s *Server) forwardRequest(w http.ResponseWriter, ctx context.Context, req 
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to forward request: %v", err), http.StatusInternalServerError)
+		sendSecureErrorResponse(w, "Service temporarily unavailable", err, logger)
 		return
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		http.Error(w, "Failed to read response", http.StatusInternalServerError)
+		sendSecureErrorResponse(w, "Response processing failed", err, logger)
 		return
 	}
 	if s.config.Global.Log.Debug.PrintResponse {
 		logger.LogContent("Forward Response", string(respBody), s.config.Global.Log.Debug.MaxContentLength)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		http.Error(w, fmt.Sprintf("Target server error: %s", resp.Status), resp.StatusCode)
+		logger.Log("Target server returned status: %d", resp.StatusCode)
+		http.Error(w, "Service error", resp.StatusCode)
 		return
 	}
 
@@ -953,6 +996,11 @@ func createHTTPClient(proxyURL string, timeout time.Duration) (*http.Client, err
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	if proxyURL != "" {
+		// 验证代理URL的安全性
+		if err := validateProxyURL(proxyURL, []string{}); err != nil {
+			return nil, fmt.Errorf("proxy validation failed: %v", err)
+		}
+		
 		parsedURL, err := url.Parse(proxyURL)
 		if err != nil {
 			return nil, fmt.Errorf("invalid proxy URL: %v", err)
